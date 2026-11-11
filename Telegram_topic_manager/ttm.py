@@ -1,352 +1,577 @@
 #!/usr/bin/env python3
+"""Envia cada pasta de input/ para um topico (criado ou existente) de um supergrupo forum."""
 
+import argparse
 import json
+import random
+import shutil
+import sys
+import tempfile
 from pathlib import Path
-from telethon import TelegramClient, functions, types
-from telethon.tl.types import UpdateChannelMessageViews
-from telethon.tl.types import Channel
-from natsort import natsorted  # Instale com: pip install natsort
-import getpass
-import asyncio
-import os
 
-SESSION_FILE = "user.session"
-CONFIG_FILE = "config.json"
-###################
-class ProgressoUpload:
-    def __init__(self, arquivo, tamanho_total):
-        self.arquivo = arquivo
-        self.tamanho_total = tamanho_total
-        self.bytes_enviados = 0
-        self.ultima_porcentagem = 0
-        
-    def atualizar(self, bytes_enviados, total):
-        self.bytes_enviados = bytes_enviados
-        porcentagem = int((bytes_enviados / self.tamanho_total) * 100)
-        
-        # Atualizar apenas se a porcentagem mudou
-        if porcentagem != self.ultima_porcentagem:
-            self.ultima_porcentagem = porcentagem
-            self.exibir()
-            
-    def exibir(self):
-        # Tamanho em MB
-        enviado_mb = self.bytes_enviados / (1024 * 1024)
-        total_mb = self.tamanho_total / (1024 * 1024)
-        
-        # Barra de progresso simples
-        barra = '⬛' * (self.ultima_porcentagem // 5) + '⬜' * (20 - (self.ultima_porcentagem // 5))
-        
-        print(f"\r[{barra}] {self.ultima_porcentagem}% | {enviado_mb:.1f}/{total_mb:.1f} MB - {self.arquivo.name}", end='', flush=True)
-#####################
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-def carregar_config():
+from tg_common import (  # noqa: E402
+    TransferProgress,
+    ask_yes_no,
+    choose_item,
+    choose_many,
+    connect,
+    human_size,
+    list_topics,
+    logout,
+    natural_key,
+    run,
+    unique_path,
+    with_flood_retry,
+)
+from telethon import errors, functions, types  # noqa: E402
+
+import video_tools  # noqa: E402
+
+
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = BASE_DIR / "input"
+OUTPUT_DIR = BASE_DIR / "output"
+# Videos originais que foram substituidos por uma versao convertida.
+ORIGINALS_DIR = BASE_DIR / "originais"
+# Marca de pasta continua: guarda o grupo e o topico para os proximos envios.
+STATE_FILE = ".ttm.json"
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+INCOMPLETE_SUFFIXES = {".part", ".ytdl", ".tmp", ".crdownload"}
+# Limite de upload do Telegram: 4000 partes de 512 KB (o dobro com Premium).
+MAX_UPLOAD_BYTES = 2000 * 1024 * 1024
+MAX_UPLOAD_BYTES_PREMIUM = 4000 * 1024 * 1024
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Envia as pastas de input/ para topicos de um supergrupo forum do Telegram."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Mostra o que seria enviado, sem conectar ao Telegram.",
+    )
+    parser.add_argument(
+        "--incluir-csv",
+        action="store_true",
+        help="Envia tambem o CSV do curso (<pasta>.csv), que por padrao fica de fora.",
+    )
+    parser.add_argument(
+        "--topicos-abertos",
+        action="store_true",
+        help="Deixa os topicos novos abertos. Por padrao eles sao fechados (so admins postam).",
+    )
+    parser.add_argument(
+        "--sem-analise",
+        action="store_true",
+        help="Pula a analise dos videos com ffprobe/ffmpeg.",
+    )
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=video_tools.X264_CRF,
+        choices=range(15, 36),
+        metavar="N",
+        help=f"Qualidade da reconversao H.264 (padrao {video_tools.X264_CRF}; maior = arquivo menor).",
+    )
+    parser.add_argument(
+        "--preset",
+        default=video_tools.X264_PRESET,
+        choices=video_tools.X264_PRESETS,
+        help=f"Velocidade da reconversao (padrao {video_tools.X264_PRESET}; mais lento = arquivo menor).",
+    )
+    parser.add_argument(
+        "--logout",
+        action="store_true",
+        help="Encerra a sessao do Telegram e apaga user.session.",
+    )
+    return parser.parse_args()
+
+
+def is_video(path):
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def course_dirs():
+    if not INPUT_DIR.exists():
+        return []
+    return sorted(
+        [path for path in INPUT_DIR.iterdir() if path.is_dir() and not path.name.startswith(".")],
+        key=lambda path: natural_key(path.name),
+    )
+
+
+# ===== Pastas continuas =====
+
+def load_state(folder):
     try:
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
-            return config["api_id"], config["api_hash"]
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return None, None
+        state = json.loads((folder / STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
 
-def salvar_config(api_id, api_hash):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({"api_id": api_id, "api_hash": api_hash}, f)
-    Path(CONFIG_FILE).chmod(0o600)
+
+def save_state(folder, group, topic_id, topic_title):
+    state = {
+        "grupo_id": group.id,
+        "grupo": group.title,
+        "topico_id": topic_id,
+        "topico": topic_title,
+    }
+    (folder / STATE_FILE).write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def folder_label(folder):
+    if not load_state(folder):
+        return folder.name
+    pending = sum(1 for path in folder.iterdir() if path.is_file() and not path.name.startswith("."))
+    return f"{folder.name}  [continua: {pending} arquivo(s) novo(s)]"
+
+
+def choose_folders_to_keep(plans):
+    """Pergunta quais pastas novas ficam em input/ para receber aulas depois."""
+    if not plans:
+        return []
+    print(
+        "\nPasta continua: fica em input/ depois do envio, e as aulas novas que voce colocar"
+        " nela vao para o mesmo topico na proxima execucao."
+    )
+    if len(plans) == 1:
+        name = plans[0].folder.name
+        return plans if ask_yes_no(f"Manter '{name}' em input/ para aulas futuras?") else []
+    if not ask_yes_no("Manter alguma destas pastas em input/ para aulas futuras?"):
+        return []
+    return choose_many(
+        plans,
+        "Pastas para manter:",
+        lambda plan: plan.folder.name,
+        prompt="Quais? (Enter = todas, ex: 1,3, 0 = nenhuma): ",
+    )
+
+
+class CoursePlan:
+    """Arquivos de uma pasta separados em: enviar, deixar de fora e incompletos."""
+
+    def __init__(self, folder, include_csv, max_bytes):
+        self.folder = folder
+        self.state = load_state(folder)
+        self.keep = bool(self.state)
+        self.to_send = []
+        self.extras = []
+        self.too_big = []
+        self.incomplete = []
+
+        for path in sorted(folder.iterdir(), key=lambda item: natural_key(item.name)):
+            if path.is_dir() or path.name.startswith("."):
+                continue
+            if path.suffix.lower() in INCOMPLETE_SUFFIXES:
+                self.incomplete.append(path)
+            elif path.name == f"{folder.name}.csv" and not include_csv:
+                # Lista gerada pelo course_dl.py: links que expiram, nao e conteudo do curso.
+                self.extras.append(path)
+            elif path.stat().st_size > max_bytes:
+                self.too_big.append(path)
+            else:
+                self.to_send.append(path)
+
+    @property
+    def total_size(self):
+        return sum(path.stat().st_size for path in self.to_send)
+
+    def describe(self):
+        line = f"{self.folder.name}: {len(self.to_send)} arquivo(s), {human_size(self.total_size)}"
+        notes = []
+        if self.state:
+            notes.append(f"pasta continua -> topico '{self.state.get('topico', '?')}'")
+        if self.incomplete:
+            notes.append(f"{len(self.incomplete)} download(s) INCOMPLETO(S)")
+        if self.too_big:
+            notes.append(f"{len(self.too_big)} acima do limite do Telegram")
+        if self.extras:
+            notes.append("CSV do curso fica de fora")
+        return line + (f"  [{'; '.join(notes)}]" if notes else "")
+
+
+def print_plan(plans):
+    print("\nPlano de envio:")
+    for plan in plans:
+        print(f"- {plan.describe()}")
+        for path in plan.incomplete:
+            print(f"    incompleto: {path.name}")
+        for path in plan.too_big:
+            print(f"    grande demais: {path.name} ({human_size(path.stat().st_size)})")
+
+
+# ===== Videos =====
+
+def analyze_videos(plans, max_bytes):
+    reports = []
+    for plan in plans:
+        for path in plan.to_send + plan.too_big:
+            if is_video(path):
+                reports.append(video_tools.analyze(path, max_bytes))
+    return reports
+
+
+def print_video_report(reports, show_commands=False):
+    print("\nAnalise dos videos:")
+    flagged = [report for report in reports if report.problems or report.suggestions or report.warnings]
+    print(f"  {len(reports) - len(flagged)} de {len(reports)} video(s) ja estao prontos para o Telegram.")
+
+    for report in flagged:
+        print(f"\n- {report.path.parent.name}/{report.path.name}")
+        print(f"    {video_tools.summary_line(report.info)}")
+        for line in video_tools.describe(report):
+            print(f"    {line}")
+        if report.needs_conversion:
+            print(f"    acao sugerida: {report.action}")
+            if show_commands:
+                if report.remux or report.reencode_video or report.reencode_audio:
+                    output = report.path.with_name(f"{report.path.stem}.telegram.mp4")
+                    print(f"    $ {video_tools.shell_command(report, output)}")
+                note = video_tools.split_note(report)
+                if note:
+                    print(f"    ({note})")
+
+
+def video_label(report):
+    optional = "" if report.problems else " (opcional)"
+    return f"{report.path.parent.name}/{report.path.name}: {report.action}{optional}"
+
+
+def offer_conversion(reports):
+    """Pergunta se os videos com sugestao devem ser convertidos. True se algo mudou."""
+    candidates = [report for report in reports if report.needs_conversion]
+    if not candidates:
+        return False
+
+    slow = [report for report in candidates if report.reencode_video]
+    print(f"\n{len(candidates)} video(s) podem ser convertidos.")
+    if slow:
+        total = video_tools.format_duration(sum(report.info.duration for report in slow if report.info))
+        print(
+            f"{len(slow)} precisam reconverter a imagem: {total} de video com preset "
+            f"{video_tools.X264_PRESET} e CRF {video_tools.X264_CRF}. O progresso aparece na tela."
+        )
+    else:
+        print("Todos sao rapidos: a imagem do video nao e recodificada.")
+    if any(report.info and report.info.size > report.max_bytes for report in candidates):
+        print(
+            f"Videos acima de {human_size(MAX_UPLOAD_BYTES)} sao divididos em ate {video_tools.MAX_PARTS} "
+            "partes, com ' - PART1', ' - PART2'... no nome e na legenda."
+        )
+    print(f"Os originais vao para {ORIGINALS_DIR.relative_to(BASE_DIR)}/<pasta>/ e nada e apagado.")
+    if not ask_yes_no("Converter agora, antes de enviar?"):
+        return False
+
+    selected = candidates
+    if len(candidates) > 1:
+        selected = choose_many(
+            candidates,
+            "Videos para converter:",
+            video_label,
+            prompt="Quais? (Enter = todos, ex: 1,3-5, 0 = nenhum): ",
+        )
+
+    changed = False
+    for index, report in enumerate(selected, start=1):
+        before = report.path.stat().st_size
+        print(f"\n[{index}/{len(selected)}] {report.path.name}: {report.action}")
+        try:
+            targets, backup = video_tools.convert(
+                report, ORIGINALS_DIR / report.path.parent.name, MAX_UPLOAD_BYTES
+            )
+        except RuntimeError as exc:
+            print(f"  [erro] {exc}")
+            continue
+        changed = True
+        after = ", ".join(f"{target.name} ({human_size(target.stat().st_size)})" for target in targets)
+        print(f"  [ok] {human_size(before)} -> {after}")
+        print(f"  Original em {backup.relative_to(BASE_DIR)}")
+    return changed
+
+
+def video_upload_options(path, temp_dir):
+    """Miniatura e atributos (duracao, dimensoes) do video, se o ffmpeg estiver instalado."""
+    if not video_tools.available():
+        return {}
+    info = video_tools.probe(path)
+    options = {}
+    attributes = video_tools.video_attributes(info, types)
+    if attributes:
+        options["attributes"] = attributes
+        thumb = video_tools.make_thumbnail(path, info, Path(temp_dir) / "thumb.jpg")
+        if thumb:
+            options["thumb"] = str(thumb)
+    return options
+
+
+async def list_admin_forum_groups(client):
+    groups = []
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
+        if not isinstance(entity, types.Channel):
+            continue
+        if not getattr(entity, "megagroup", False):
+            continue
+        if not getattr(entity, "forum", False):
+            continue
+        if getattr(entity, "creator", False) or getattr(entity, "admin_rights", None):
+            groups.append(entity)
+
+    return sorted(groups, key=lambda group: group.title.casefold())
+
+
+async def get_or_create_topic(client, group, title, topic_ids, close_new_topics):
+    # topic_ids: titulo em minusculas -> ID, para reaproveitar topicos com o mesmo nome.
+    existing_id = topic_ids.get(title.casefold())
+    if existing_id:
+        print(f"Topico existente: {title} (ID {existing_id})")
+        return existing_id
+
+    peer = await client.get_input_entity(group)
+    result = await with_flood_retry(
+        client,
+        functions.messages.CreateForumTopicRequest(
+            peer=peer,
+            title=title,
+            random_id=random.getrandbits(63),
+        ),
+    )
+    topic_id = extract_created_topic_id(result)
+    if not topic_id:
+        raise RuntimeError("Nao foi possivel descobrir o ID do topico criado.")
+
+    print(f"Topico criado: {title} (ID {topic_id})")
+    topic_ids[title.casefold()] = topic_id
+
+    if close_new_topics:
+        await with_flood_retry(
+            client,
+            functions.messages.EditForumTopicRequest(
+                peer=peer,
+                topic_id=topic_id,
+                closed=True,
+            ),
+        )
+        print("Topico novo fechado: so admins podem postar nele.")
+
+    return topic_id
+
+
+def extract_created_topic_id(result):
+    updates = getattr(result, "updates", [])
+    # O ID do topico e o ID da mensagem de servico "topico criado".
+    for update in updates:
+        message = getattr(update, "message", None)
+        if message and isinstance(getattr(message, "action", None), types.MessageActionTopicCreate):
+            return message.id
+    for update in updates:
+        if isinstance(update, types.UpdateMessageID):
+            return update.id
+    return None
+
+
+async def sent_file_names(client, group, topic_id):
+    names = set()
+    async for message in client.iter_messages(group, reply_to=topic_id, limit=None):
+        if message.file and message.file.name:
+            names.add(message.file.name)
+    return names
+
+
+async def upload_course(client, group, topic_id, plan, results):
+    already_sent = await sent_file_names(client, group, topic_id)
+    folder_name = plan.folder.name
+
+    for path in plan.to_send:
+        if path.name in already_sent:
+            print(f"[skip] Ja enviado: {path.name}")
+            move_to_output(path, folder_name)
+            results["skipped"] += 1
+            continue
+
+        print(f"\nEnviando: {path.name} ({human_size(path.stat().st_size)})")
+        try:
+            with tempfile.TemporaryDirectory(prefix="ttm-") as temp_dir:
+                extra = video_upload_options(path, temp_dir) if is_video(path) else {}
+                await with_flood_retry(
+                    client.send_file,
+                    entity=group,
+                    file=str(path),
+                    caption=path.stem,
+                    force_document=not is_video(path),
+                    supports_streaming=is_video(path),
+                    reply_to=topic_id,
+                    progress_callback=TransferProgress(path.name),
+                    **extra,
+                )
+        except (errors.RPCError, OSError, ValueError) as exc:
+            # Falha em um arquivo nao derruba a pasta; ele continua em input/.
+            print(f"\n[erro] {path.name}: {exc}")
+            results["failed"] += 1
+            continue
+
+        print("\n[ok] Upload concluido.")
+        move_to_output(path, folder_name)
+        results["sent"] += 1
+
+    for path in plan.extras:
+        move_to_output(path, folder_name)
+    if plan.keep:
+        print(f"Pasta {folder_name} continua em input/: coloque as proximas aulas nela.")
+    else:
+        remove_if_empty(plan.folder)
+
+
+def move_to_output(path, course_name):
+    target_dir = OUTPUT_DIR / course_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = unique_path(target_dir / path.name)
+    shutil.move(str(path), str(target))
+
+
+def remove_if_empty(folder):
+    try:
+        folder.rmdir()
+        print(f"Pasta {folder.name} concluida e removida de input/.")
+    except OSError:
+        print(f"Pasta {folder.name} ainda tem arquivos em input/ (falhas ou pendentes).")
+
 
 async def main():
-    api_id, api_hash = carregar_config()
+    args = parse_args()
+    video_tools.configure(crf=args.crf, preset=args.preset)
+    if args.logout:
+        await logout()
+        return
 
-    # Coletar credenciais se não existirem
-    if not api_id or not api_hash:
-        print("=== Configuração Inicial ===")
-        api_id = input("Digite seu API ID do Telegram: ").strip()
-        api_hash = getpass.getpass("Digite seu API Hash: ").strip()
-        salvar_config(api_id, api_hash)
-        print("\nConfiguração salva!\n")
+    folders = course_dirs()
+    if not folders:
+        print(f"Nenhuma pasta de curso encontrada em {INPUT_DIR}")
+        return
 
-    # Iniciar cliente
-    client = TelegramClient(SESSION_FILE, api_id, api_hash)
-    
+    selected = choose_many(folders, "Pastas encontradas em input:", folder_label)
+    if not selected:
+        print("Operacao cancelada.")
+        return
+
+    plans = [CoursePlan(folder, args.incluir_csv, MAX_UPLOAD_BYTES) for folder in selected]
+    print_plan(plans)
+
+    # Analise e conversao rodam antes de conectar: nao dependem do Telegram e podem demorar.
+    if not args.sem_analise:
+        if not video_tools.available():
+            print("\n[aviso] ffmpeg/ffprobe nao encontrados: analise dos videos desativada.")
+        else:
+            reports = analyze_videos(plans, MAX_UPLOAD_BYTES)
+            if reports:
+                print_video_report(reports, show_commands=args.dry_run)
+                if not args.dry_run and offer_conversion(reports):
+                    plans = [CoursePlan(folder, args.incluir_csv, MAX_UPLOAD_BYTES) for folder in selected]
+                    print_plan(plans)
+
+    if args.dry_run:
+        print("\nModo dry-run: nada foi enviado nem convertido.")
+        return
+
+    if not any(plan.to_send or plan.extras or plan.too_big or plan.incomplete for plan in plans):
+        print("\nNada para enviar: as pastas escolhidas nao tem arquivos novos.")
+        return
+
+    client, me = await connect()
     try:
-        await client.start()
-        print("\n=== Login realizado com sucesso! ===")
+        max_bytes = MAX_UPLOAD_BYTES_PREMIUM if getattr(me, "premium", False) else MAX_UPLOAD_BYTES
+        if max_bytes != MAX_UPLOAD_BYTES:
+            # Conta Premium: o limite maior pode liberar arquivos grandes.
+            plans = [CoursePlan(folder, args.incluir_csv, max_bytes) for folder in selected]
+            print_plan(plans)
 
-        # Listar grupos do usuário
-        print("\nBuscando grupos...")
-        grupos = []
-        async for dialog in client.iter_dialogs():
-            chat = dialog.entity
-            if isinstance(chat, Channel) and chat.creator and chat.forum:
-                grupos.append(chat)
+        incomplete = [plan for plan in plans if plan.incomplete]
+        if incomplete and not ask_yes_no(
+            "\nHa pastas com downloads incompletos. Enviar essas pastas mesmo assim?"
+        ):
+            plans = [plan for plan in plans if not plan.incomplete]
+            print("Pastas com downloads incompletos ficaram de fora.")
 
-        # Exibir grupos numerados
-        print("\nGrupos disponíveis (com tópicos habilitados):")
-        for i, grupo in enumerate(grupos, 1):
-            print(f"{i}. {grupo.title}")
-            
-        # Seleção do grupo
-        while True:
+        for plan in plans:
+            if plan.state and not (plan.to_send or plan.extras):
+                print(f"{plan.folder.name}: nenhuma aula nova desde o ultimo envio.")
+        plans = [plan for plan in plans if plan.to_send or plan.extras]
+        if not plans:
+            print("Nada para enviar.")
+            return
+
+        groups = await list_admin_forum_groups(client)
+        group = None
+        remembered = {plan.state.get("grupo_id") for plan in plans if plan.state}
+        if len(remembered) == 1:
+            # Pastas continuas: sugere o mesmo supergrupo do envio anterior.
+            group_id = remembered.pop()
+            match = next((item for item in groups if item.id == group_id), None)
+            if match and ask_yes_no(
+                f"\nUsar o supergrupo '{match.title}', o mesmo dos envios anteriores?", default=True
+            ):
+                group = match
+        if group is None:
+            group = choose_item(
+                groups,
+                "Supergrupos com topicos onde sua conta parece ter permissao:",
+                lambda item: item.title,
+            )
+        if not group:
+            print("Nenhum supergrupo escolhido.")
+            return
+
+        if not ask_yes_no(f"\nCriar/usar {len(plans)} topico(s) em '{group.title}' e enviar?"):
+            print("Operacao cancelada.")
+            return
+
+        for plan in choose_folders_to_keep([plan for plan in plans if not plan.state]):
+            plan.keep = True
+
+        close_new_topics = not args.topicos_abertos
+        if close_new_topics:
+            print("Topicos novos serao fechados: so admins postam (use --topicos-abertos para mudar).")
+
+        topics = await list_topics(client, group)
+        topic_ids = {topic.title.casefold(): topic.id for topic in topics}
+        topic_titles = {topic.id: topic.title for topic in topics}
+        results = {"sent": 0, "skipped": 0, "failed": 0}
+        for plan in plans:
+            print(f"\n=== {plan.folder.name} ===")
             try:
-                escolha = int(input("\nDigite o número do grupo: "))
-                grupo_escolhido = grupos[escolha-1]
-                break
-            except (ValueError, IndexError):
-                print("Número inválido. Tente novamente.")
-                
-        # Verificar pasta input
-        input_dir = Path("input")
-        if not input_dir.exists():
-            print("\nPasta 'input' não encontrada!")
-            return
-        
-        # Listar cursos/tópicos a serem criados
-        pastas_cursos = [d for d in input_dir.iterdir() if d.is_dir()]
-        if not pastas_cursos:
-            print("\nNenhum curso encontrado na pasta 'input'!")
-            return
-        
-        print("\nCursos encontrados para criação:")
-        for pasta in pastas_cursos:
-            print(f"- {pasta.name}")
-            
-        # Confirmar com usuário
-        confirmar = input("\nDeseja criar esses tópicos e enviar conteúdo? (s/N): ").lower()
-        print(confirmar)
-        if confirmar != 's':
-            print("Operação cancelada.")
-            return
-        
-        # Criar tópicos e processar conteúdo
-        for pasta_curso in pastas_cursos:
-            nome_topico = pasta_curso.name
-            print(f"\nProcessando: {nome_topico}")
-            
-            # Verifica/Cria tópico
-            topico_id = await criar_ou_obter_topico(client, grupo_escolhido, nome_topico)
-            
-            if not topico_id:
-                print("❌ Não foi possível obter/criar o tópico. Pulando...")
-                continue
-            
-            # Verifica conteúdo já enviado
-            ja_enviados = await listar_conteudo_enviado(client, grupo_escolhido, topico_id)
-            
-            # Processa arquivos
-            await processar_conteudo(client, grupo_escolhido, topico_id, pasta_curso, ja_enviados)
+                topic_id = None
+                if plan.state and plan.state.get("grupo_id") == group.id:
+                    saved_id = plan.state.get("topico_id")
+                    if saved_id in topic_titles:
+                        # Vale mesmo que o topico tenha sido renomeado no app.
+                        topic_id = saved_id
+                        print(f"Topico da pasta continua: {topic_titles[saved_id]} (ID {saved_id})")
+                    else:
+                        print("[aviso] O topico salvo para esta pasta nao existe mais; procurando pelo nome.")
+                if topic_id is None:
+                    topic_id = await get_or_create_topic(
+                        client, group, plan.folder.name, topic_ids, close_new_topics
+                    )
+                    topic_titles.setdefault(topic_id, plan.folder.name)
+                if plan.keep:
+                    save_state(plan.folder, group, topic_id, topic_titles[topic_id])
+                await upload_course(client, group, topic_id, plan, results)
+            except errors.RPCError as exc:
+                print(f"[erro] Falha em {plan.folder.name}: {exc}")
+                results["failed"] += len(plan.to_send)
 
+        print("\nResumo:")
+        print(f"  Enviados: {results['sent']}")
+        print(f"  Ja estavam no topico: {results['skipped']}")
+        print(f"  Falharam: {results['failed']}")
     finally:
         await client.disconnect()
-        
-        
-async def criar_ou_obter_topico(client, grupo, nome_topico):
-    try:
-        # Verifica tópico existente
-        topico_id = await verificar_topico_existente(client, grupo, nome_topico)
-        if topico_id:
-            print(f"Tópico existente encontrado: ID {topico_id}")
-            return topico_id
 
-        # Cria novo tópico
-        result = await client(functions.channels.CreateForumTopicRequest(
-            channel=grupo,
-            title=nome_topico
-        ))
-        # print(f"o ID do topico novo é{result.topic.id} ou então {result.updates}")
-
-        # Extrai o ID do tópico da resposta
-        topic_id =  None
-        for update in result.updates:
-            # Método 1: Atualização direta do tópico
-            if hasattr(update, 'topic') and isinstance(update.topic, types.ForumTopic):
-                print("Pegou tópico do update")
-                topic_id = update.topic.id
-                break
-                
-            # Método 2: Mensagem de serviço de criação
-            if isinstance(update, types.UpdateNewChannelMessage):
-                msg = update.message
-                if isinstance(msg.action, types.MessageActionTopicCreate):
-                    print("Pegou tópico do update das mensagens")
-                    topic_id = msg.id #return msg.id  # ID da mensagem raiz do tópico
-                    break
-
-        if not topic_id:
-            raise ValueError("ID do tópico não encontrado na resposta")
-        
-        #Fechar o tópico(trancar ele não apaga o tópico)
-        await client(functions.channels.EditForumTopicRequest(
-            channel=grupo,
-            topic_id=topic_id,
-            closed=True  # ← Parâmetro crucial
-        ))
-        print("Tópico configurado como fechado com sucesso!")
-
-        return topic_id
-    
-    except Exception as e:
-        print(f"Erro na criação do tópico: {str(e)}")
-        return None
-    
-async def verificar_topico_existente(client, grupo, nome_topico):
-    try:
-        # Converter para InputChannel corretamente
-        input_channel = types.InputChannel(
-            channel_id=grupo.id,
-            access_hash=grupo.access_hash
-        )
-        
-        all_topics = []
-        offset_date = 0
-        offset_id = 0
-        offset_topic = 0
-        total = 0
-        
-        while True:
-            # Fazer a requisição com todos os offsets
-            result = await client(functions.channels.GetForumTopicsRequest(
-                channel=input_channel,
-                offset_date=offset_date,
-                offset_id=offset_id,
-                offset_topic=offset_topic,
-                limit=100  # Máximo permitido pela API
-            ))
-            
-            # Capturar o total real na primeira iteração
-            if not total:
-                total = result.count
-            
-            # Processar tópicos válidos
-            valid_topics = [t for t in result.topics if isinstance(t, types.ForumTopic)]
-            
-            # Verificar se encontrou o tópico
-            for topic in result.topics:
-                if topic.title == nome_topico:
-                    return topic.id
-            
-            # Atualizar offsets com base no último tópico
-            if valid_topics:
-                last_topic = valid_topics[-1]
-                
-                # Obter a data da última mensagem do tópico
-                last_message = next((m for m in result.messages 
-                                   if m.id == last_topic.top_message), None)
-                
-                offset_date = last_message.date if last_message else 0
-                offset_id = last_topic.top_message
-                offset_topic = last_topic.id
-            else:
-                break  # Não há mais tópicos
-            
-            # Condição de saída quando atingir o total
-            if len(all_topics) + len(valid_topics) >= total:
-                break
-                
-            all_topics.extend(valid_topics)
-
-        return None
-
-    except Exception as e:
-        print(f"Erro na verificação de tópicos: {str(e)}")
-        return None
-
-async def listar_conteudo_enviado(client, grupo, topico_id):
-    try:
-        mensagens = await client.get_messages(
-            entity=grupo,
-            limit=100,
-            reply_to=topico_id  # ← Parâmetro correto para tópicos
-        )
-        return {msg.file.name if msg.file else None for msg in mensagens}
-    except Exception as e:
-        print(f"Erro ao verificar mensagens: {str(e)}")
-        return set()
-
-
-async def processar_conteudo(client, grupo, topico_id, pasta_curso, ja_enviados):
-    arquivos = ordenar_arquivos(pasta_curso)
-    
-    for arquivo in arquivos:
-        if arquivo.name in ja_enviados:
-            print(f"⏩ Pulando arquivo já enviado: {arquivo.name}")
-            continue
-        
-        if is_video(arquivo):
-            await enviar_video(client, grupo, topico_id, arquivo)
-        else:
-            await enviar_arquivo(client, grupo, topico_id, arquivo)
-        
-        # Mover para output
-        mover_para_output(arquivo, pasta_curso.name)
-
-def ordenar_arquivos(pasta):
-    arquivos = list(pasta.iterdir())
-    return natsorted(arquivos, key=lambda x: (not is_video(x), x.name))
-
-def is_video(arquivo):
-    return arquivo.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv']
-
-async def enviar_video(client, grupo, topico_id, caminho):
-    legenda = caminho.stem
-    print(f"Enviando vídeo: {legenda}")
-    
-    try:
-        # Criar objeto InputForumTopic com o ID do tópico
-        # forum_topic = types.InputForumTopic(
-        #     channel=await client.get_input_channel(grupo.id),
-        #     topic_id=topico_id
-        # )
-        
-        # Criar objeto de progresso
-        tamanho = caminho.stat().st_size
-        progresso = ProgressoUpload(caminho, tamanho)
-        
-        await client.send_file(
-            entity=grupo,
-            file=str(caminho),
-            caption=legenda,
-            supports_streaming=True,
-            # Usar reply_to com ID da mensagem do tópico
-            reply_to=topico_id,  # ← Mudança crucial aqui
-            progress_callback=progresso.atualizar
-        )
-        print("\n✅ Upload concluído!")
-        
-    except Exception as e:
-        print(f"Erro ao enviar vídeo: {str(e)}")
-        
-async def enviar_arquivo(client, grupo, topico_id, caminho):
-    legenda = caminho.stem  # Nome do arquivo sem extensão
-    print(f"Enviando arquivo: {legenda}")
-    
-    try:
-        # Criar objeto de progresso
-        tamanho = caminho.stat().st_size
-        progresso = ProgressoUpload(caminho, tamanho)
-        
-        await client.send_file(
-            entity=grupo,
-            file=str(caminho),
-            caption=legenda,
-            # Parâmetros diferentes do envio de vídeo:
-            force_document=True,  # Forçar como documento
-            supports_streaming=False,
-            reply_to=topico_id,
-            progress_callback=progresso.atualizar
-        )
-        print("\n✅ Upload concluído!")
-        
-    except Exception as e:
-        print(f"\n❌ Erro ao enviar arquivo: {str(e)}")
-
-def mover_para_output(arquivo, nome_curso):
-    output_dir = Path("output") / nome_curso
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    destino = output_dir / arquivo.name
-    try:
-        arquivo.rename(destino)
-    except Exception as e:
-        print(f"Erro ao mover arquivo: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run(main())

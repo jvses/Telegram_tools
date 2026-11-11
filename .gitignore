@@ -2,8 +2,9 @@
 # user.session e a conta logada: quem tiver o arquivo acessa a conta.
 *.session
 *.session-journal
-# api_id / api_hash gerados na primeira execucao
+# api_id / api_hash gerados na primeira execucao (e o temporario da gravacao)
 config.json
+config.json.tmp
 .env
 .env.*
 
@@ -13,10 +14,12 @@ config.json
 **/input/*
 !**/input/.gitkeep
 output/
+# Videos originais guardados depois da conversao com ffmpeg
+originais/
 # Telegram_specific_topic_dl: midias baixadas
 downloads/
-
-# Midias soltas, como as pastas que o tldlsp.py antigo cria ao lado do script.
+ideias_alteracoes.txt
+# Midias soltas em qualquer outro lugar do repositorio.
 # Para imagens de documentacao, use a pasta docs/ (liberada abaixo).
 *.mp4
 *.mkv
@@ -45,10 +48,10 @@ downloads/
 *.part
 *.part-Frag*
 *.ytdl
+.*.convertendo.mp4
 
 # ===== Python =====
 .venv/
-.tldl_venv/
 venv/
 env/
 __pycache__/

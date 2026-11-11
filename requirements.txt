@@ -1,0 +1,17 @@
+# Ambiente virtual unico na raiz do repositorio (.venv), usado pelas duas ferramentas.
+# Testado em 2026-11-06 com Python 3.14.8 e as versoes abaixo.
+
+# Biblioteca do Telegram (MTProto). A serie 1.x e a estavel; a 2.x nunca saiu no PyPI
+# e muda a API, por isso o teto <2.
+Telethon>=1.45,<2        # testado: 1.45.0
+
+# Criptografia em C: uploads e downloads bem mais rapidos. Exige Python 3.11+.
+cryptg>=0.6              # testado: 0.6.1
+
+# Le duracao e resolucao dos videos enviados (sem ele o Telegram mostra o video
+# sem duracao e com proporcao errada).
+hachoir>=3.4             # testado: 3.4.0
+
+# Fora do pip: a analise/conversao de videos e as miniaturas do ttm.py usam os
+# programas ffmpeg e ffprobe do sistema (Arch: pacman -S ffmpeg; Debian/Ubuntu:
+# apt install ffmpeg). Sem eles o ttm.py funciona, so pula essa etapa.
