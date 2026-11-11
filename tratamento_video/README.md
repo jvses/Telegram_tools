@@ -10,7 +10,7 @@ Remove as pausas longas: intervalo com a gravação rodando, esquecer de pausar,
 python tratamento_video/cortar_silencio.py calibrar "aula 07.mp4"   # 0. uma vez por curso (opcional)
 python tratamento_video/cortar_silencio.py detectar "aula 07.mp4"   # 1. gera "aula 07.mp4.cortes.txt"
 python tratamento_video/cortar_silencio.py revisar  "aula 07.mp4"   # 2. decide o que está em dúvida
-python tratamento_video/cortar_silencio.py cortar   "aula 07.mp4"   # 3. gera editados/aula 07.mp4
+python tratamento_video/cortar_silencio.py cortar   "aula 07.mp4"   # 3. edita; o original vai para orig/
 ```
 
 `detectar` também aceita pastas e vários arquivos de uma vez.
@@ -89,13 +89,30 @@ flatpak override --user --filesystem=home org.videolan.VLC
 
 ### 3. cortar
 
-Gera o vídeo sem os trechos `CORTAR` em `<pasta do vídeo>/editados/<nome>.mp4`. Com `--saida PASTA`, salva em outro lugar, por exemplo direto na pasta contínua do ttm.
+Gera o vídeo sem os trechos `CORTAR`. Ele **fica no lugar do original**, com o mesmo nome e extensão `.mp4`. O original e a lista de cortes vão para `orig/`, na mesma pasta:
 
-- O vídeo é reconvertido com os mesmos parâmetros do `ttm.py`: H.264 preset `fast`, CRF 23, AAC, taxa constante e faststart. Assim ele chega pronto para o envio. `--crf` e `--preset` mudam a reconversão.
-- O corte é preciso no quadro, e áudio e vídeo continuam sincronizados.
-- Antes de começar, o script mostra quanto vai ser removido. Ao terminar, confere se a duração do resultado bate com a esperada.
+```
+aulas/aula 07.mp4                      <- editado
+aulas/orig/aula 07.mp4                 <- original, intacto
+aulas/orig/aula 07.mp4.cortes.txt
+```
+
+Com `--saida PASTA`, o editado vai para outro lugar, por exemplo direto para a pasta contínua do ttm. O original vai para `orig/` do mesmo jeito.
+
+**Modo de corte (`--modo`, padrão `auto`):**
+
+| Modo | Quando o `auto` escolhe | Como corta |
+|---|---|---|
+| `copia` | O vídeo já é H.264 + AAC/MP3 (MP4, ou MKV com esses codecs) e não precisa de mais nada. | `-c copy`: **mesma qualidade e tamanho proporcional ao original**, leva segundos. Cada trecho mantido começa no keyframe anterior (de 2 em 2 a 10 em 10 s, conforme a gravação), então sobram alguns segundos de cada pausa, nunca fala. |
+| `converter` | WebM, VP8/VP9, Opus, HEVC, 10 bits, bitrate alto, acima de 1080p… | Reconverte com os parâmetros do `ttm.py` (H.264 preset `fast`, CRF 23, AAC, taxa constante). Corte exato no quadro, mas demora. |
+
+- Use `--modo converter` para forçar o corte exato num MP4, ou `--modo copia` para nunca reconverter.
+- Antes de começar, o script mostra o modo, o motivo e quanto vai ser removido. No modo cópia, mostra também quanto de pausa sobra por causa dos keyframes.
+- Ao terminar, confere a duração e se áudio e vídeo têm o mesmo comprimento. Se o corte por cópia falhar nessa conferência, o script refaz pelo modo converter.
+- Nos testes com taxa de quadros variável e B-frames, a sincronia ficou em 1 quadro nos dois modos.
 - Pausas ainda em `REVISAR` ficam no vídeo, e o script avisa antes.
 - Se o resultado passar de 2000 MB, o `ttm.py` divide em PART1, PART2… no envio.
+- Rodar `cortar` de novo no editado não corta duas vezes: a lista de cortes foi para `orig/`.
 
 Os tempos de capítulos que você escrever depois devem usar o vídeo **editado**.
 

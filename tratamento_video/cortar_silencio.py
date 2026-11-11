@@ -10,8 +10,9 @@ Fluxo:
                   mudando: demonstracao de software, simulacao, escrita na mesa digitalizadora).
   2. revisar   -> abre cada pausa REVISAR no player (mpv, VLC, MPlayer, ffplay...) e pergunta
                   o que fazer. Tambem da para editar o .cortes.txt a mao.
-  3. cortar    -> gera o video sem os trechos CORTAR em <pasta do video>/editados/, ja em
-                  H.264/AAC/MP4 pronto para o ttm.py. O original nunca e alterado.
+  3. cortar    -> gera o video sem os trechos CORTAR no lugar do original, que vai (com a lista
+                  de cortes) para <pasta>/orig/. Se o video ja e H.264/AAC, corta sem reconverter
+                  (mesma qualidade); senao (WebM etc.) converte para H.264/AAC/MP4.
 
 Exemplos:
   python cortar_silencio.py calibrar "aula 07.mp4"
@@ -41,7 +42,7 @@ import video_tools  # noqa: E402  (mesmos parametros de conversao do ttm.py)
 
 EXTENSOES = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
 SUFIXO_CORTES = ".cortes.txt"
-PASTA_EDITADOS = "editados"
+PASTA_ORIGINAIS = "orig"                   # originais depois do corte
 ARQUIVO_CONFIG = ".cortar_silencio.json"   # mascara da tela, por pasta (curso)
 ARQUIVO_PREVIA = "mascara_tela.png"
 
@@ -984,6 +985,187 @@ def trechos_mantidos(cortes, duracao):
     return [(inicio, fim) for inicio, fim in mantidos if fim - inicio >= 0.5]
 
 
+def escolher_modo(relatorio, pedido):
+    """'copia' (sem perda) quando o video ja serve para o Telegram; 'converter' quando precisa."""
+    motivos = relatorio.problems + relatorio.suggestions
+    precisa = relatorio.reencode_video or relatorio.reencode_audio
+    if pedido == "copia":
+        if precisa:
+            print("[aviso] --modo copia num video que precisaria de conversao: "
+                  "o resultado pode nao tocar bem no Telegram.")
+        return "copia", "pedido com --modo copia"
+    if pedido == "converter":
+        return "converter", "pedido com --modo converter"
+    if precisa:
+        return "converter", "; ".join(motivos) or "formato nao compativel"
+    return "copia", "ja e H.264 + AAC, adequado para o Telegram"
+
+
+def keyframes_video(video):
+    resultado = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(video)],
+        capture_output=True, text=True,
+    )
+    tempos = []
+    for linha in resultado.stdout.splitlines():
+        partes = linha.strip().split(",")
+        if len(partes) >= 2 and partes[1].startswith("K") and partes[0] not in ("", "N/A"):
+            tempos.append(float(partes[0]))
+    return sorted(tempos)
+
+
+def planejar_copia(mantidos, keyframes):
+    """Sem reconverter, cada trecho mantido so pode comecar num keyframe: recua o inicio ate o
+    keyframe anterior (o que sobra e silencio da pausa, nunca fala). Se o keyframe cair dentro
+    do trecho anterior, os dois trechos viram um so (aquela pausa fica inteira)."""
+    import bisect
+
+    plano = []
+    perdidos = 0
+    for inicio, fim in mantidos:
+        posicao = bisect.bisect_right(keyframes, inicio + 0.001) - 1
+        chave = keyframes[posicao] if posicao >= 0 else 0.0
+        if plano and chave <= plano[-1][1]:
+            plano[-1] = (plano[-1][0], fim)
+            perdidos += 1
+        else:
+            plano.append((chave, fim))
+    return plano, perdidos
+
+
+def _rodar(comando, erro):
+    resultado = subprocess.run(comando, capture_output=True, text=True)
+    if resultado.returncode != 0:
+        raise RuntimeError(f"{erro}: {resultado.stderr.strip()[-300:]}")
+
+
+def cortar_copiando(video, plano, faixa, destino):
+    """Corta com -c copy: mesma qualidade e tamanho proporcional ao original."""
+    pasta = destino.parent
+    partes = []
+    lista = pasta / f".{destino.stem}.partes.txt"
+    try:
+        for numero, (inicio, fim) in enumerate(plano, start=1):
+            print(f"\r  copiando trecho {numero}/{len(plano)}", end="", flush=True)
+            parte = pasta / f".{destino.stem}.parte{numero:03d}.mp4"
+            partes.append(parte)
+            busca = ["-ss", f"{inicio + 0.001:.3f}"] if inicio > 0 else []
+            _rodar(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *busca, "-i", str(video),
+                 "-t", f"{fim - inicio:.3f}", "-map", "0:v:0", "-map", f"0:a:{faixa}?", "-c", "copy",
+                 "-avoid_negative_ts", "make_zero", "-f", "mp4", str(parte)],
+                "ffmpeg falhou ao copiar um trecho",
+            )
+        print()
+        lista.write_text(
+            "".join("file '" + str(parte.resolve()).replace("'", "'\\''") + "'\n" for parte in partes),
+            encoding="utf-8",
+        )
+        print("  juntando os trechos...", flush=True)
+        _rodar(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+             "-i", str(lista), "-map", "0", "-c", "copy", "-map_metadata", "-1",
+             "-movflags", "+faststart", "-f", "mp4", str(destino)],
+            "ffmpeg falhou ao juntar os trechos",
+        )
+    finally:
+        for parte in partes:
+            parte.unlink(missing_ok=True)
+        lista.unlink(missing_ok=True)
+
+
+def duracoes_faixas(video):
+    resultado = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "csv=p=0", str(video)],
+        capture_output=True, text=True,
+    )
+    duracoes = {}
+    for linha in resultado.stdout.splitlines():
+        tipo, _, valor = linha.partition(",")
+        if tipo in ("video", "audio") and tipo not in duracoes:
+            try:
+                duracoes[tipo] = float(valor)
+            except ValueError:
+                pass
+    return duracoes
+
+
+def cortar_convertendo(video, info, relatorio, mantidos, faixa, destino, duracao_final):
+    """Reconverte so os trechos mantidos. Cada trecho e recortado a parte (trim/atrim) e o
+    filtro concat realinha audio e video no inicio de cada um: o erro fica em 1 quadro e nao
+    se acumula de um corte para o outro (com select/aselect num video de taxa variavel,
+    3 cortes ja davam 175 ms de atraso)."""
+    roteiro = destino.with_name(f".{destino.stem}.filtro.txt")
+    fps = video_tools.output_fps(info)
+    filtros = [filtro for filtro in relatorio.video_filters if not filtro.startswith("fps=")]
+    if not any(filtro.startswith("scale=") for filtro in filtros):
+        filtros.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")  # H.264 yuv420p exige dimensoes pares
+    extras = "".join(f",{filtro}" for filtro in filtros)
+    tem_audio = info.audio_streams > 0
+    quantidade = len(mantidos)
+    linhas = [f"[0:v:0]fps={fps}{extras},split={quantidade}" + "".join(f"[v{n}]" for n in range(quantidade))]
+    if tem_audio:
+        linhas.append(f"[0:a:{faixa}]asplit={quantidade}" + "".join(f"[a{n}]" for n in range(quantidade)))
+    juntar = ""
+    for numero, (inicio, fim) in enumerate(mantidos):
+        # Desloca pelo tempo exato do corte (nao pelo 1o quadro): preserva a fracao de quadro.
+        linhas.append(f"[v{numero}]trim=start={inicio:.6f}:end={fim:.6f},setpts=PTS-{inicio:.6f}/TB[vt{numero}]")
+        juntar += f"[vt{numero}]"
+        if tem_audio:
+            linhas.append(f"[a{numero}]atrim=start={inicio:.6f}:end={fim:.6f},asetpts=PTS-{inicio:.6f}/TB[at{numero}]")
+            juntar += f"[at{numero}]"
+    saidas = "[v][a]" if tem_audio else "[v]"
+    linhas.append(f"{juntar}concat=n={quantidade}:v=1:a={1 if tem_audio else 0}{saidas}")
+    roteiro.write_text(";\n".join(linhas), encoding="utf-8")
+    comando = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(video),
+        "-/filter_complex", str(roteiro), "-map", "[v]",
+        "-c:v", "libx264", "-preset", video_tools.X264_PRESET, "-crf", str(video_tools.X264_CRF),
+        "-profile:v", "high", "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
+        "-force_key_frames", f"expr:gte(t,n_forced*{video_tools.KEYFRAME_SECONDS})",
+    ]
+    if tem_audio:
+        comando += ["-map", "[a]", "-c:a", "aac", "-b:a", video_tools.AAC_BITRATE,
+                    "-ac", str(min(info.channels or 2, 2))]
+    comando += ["-map_metadata", "0", "-movflags", "+faststart", "-f", "mp4", str(destino)]
+    try:
+        video_tools.run_ffmpeg(comando, duracao_final, "convertendo")
+    finally:
+        roteiro.unlink(missing_ok=True)
+
+
+def conferir_resultado(caminho, esperado, folga):
+    """Duracao total e sincronia (video e audio com a mesma duracao)."""
+    resultado = video_tools.probe(caminho)
+    if resultado is None:
+        raise RuntimeError("o resultado nao pode ser lido")
+    if abs(resultado.duration - esperado) > folga:
+        raise RuntimeError(
+            f"duracao do resultado ({fmt_tempo(resultado.duration)}) nao bate com a esperada ({fmt_tempo(esperado)})"
+        )
+    faixas = duracoes_faixas(caminho)
+    if "video" in faixas and "audio" in faixas and abs(faixas["video"] - faixas["audio"]) > folga:
+        raise RuntimeError(
+            f"video ({fmt_tempo(faixas['video'])}) e audio ({fmt_tempo(faixas['audio'])}) com duracoes diferentes"
+        )
+
+
+def guardar_original(video, lista):
+    """Move o original e a lista de cortes para <pasta>/orig/."""
+    pasta = video.parent / PASTA_ORIGINAIS
+    pasta.mkdir(exist_ok=True)
+    destino = pasta / video.name
+    contador = 1
+    while destino.exists() or arquivo_cortes(destino).exists():
+        destino = pasta / f"{video.stem}_{contador}{video.suffix}"
+        contador += 1
+    shutil.move(str(video), str(destino))
+    if lista.exists():
+        shutil.move(str(lista), str(arquivo_cortes(destino)))
+    return destino
+
+
 def cortar(args):
     checar_ffmpeg()
     video, lista = video_de(args.alvo)
@@ -1003,7 +1185,7 @@ def cortar(args):
     revisar_restantes = [t for t in trechos if t.acao == "REVISAR"]
     if revisar_restantes:
         print(f"{len(revisar_restantes)} pausa(s) ainda estao como REVISAR e vao ficar no video.")
-        if not sim_nao("Continuar mesmo assim?"):
+        if not args.sim and not sim_nao("Continuar mesmo assim?"):
             print(f"Use: python {Path(__file__).name} revisar \"{video}\"")
             return
 
@@ -1012,64 +1194,70 @@ def cortar(args):
         print("Nenhum trecho marcado como CORTAR. Nada a fazer.")
         return
     mantidos = trechos_mantidos(cortes, duracao)
-    final = sum(fim - inicio for inicio, fim in mantidos)
+    exato = sum(fim - inicio for inicio, fim in mantidos)
+    faixa = (args.faixa - 1) if args.faixa else 0
 
-    saida_dir = Path(args.saida) if args.saida else video.parent / PASTA_EDITADOS
+    modo, motivo = escolher_modo(relatorio, args.modo)
+    plano = None
+    if modo == "copia":
+        plano, perdidos = planejar_copia(mantidos, keyframes_video(video))
+        final = sum(fim - inicio for inicio, fim in plano)
+    else:
+        final = exato
+
+    saida_dir = Path(args.saida) if args.saida else video.parent
     saida = saida_dir / f"{video.stem}.mp4"
     print(f"\n{video.name}: {fmt_duracao(duracao)} -> {fmt_duracao(final)} "
           f"({len(cortes)} corte(s), {fmt_duracao(duracao - final)} removidos)")
-    print(f"Saida: {saida}")
-    print(f"Reconversao: H.264 preset {video_tools.X264_PRESET}, CRF {video_tools.X264_CRF}, AAC; "
-          "o original nao e alterado.")
-    if saida.exists() and not args.sim and not sim_nao(f"{saida.name} ja existe. Substituir?"):
-        return
+    if modo == "copia":
+        print(f"Modo copia ({motivo}): sem reconverter, mesma qualidade, leva poucos segundos.")
+        sobra = final - exato
+        if sobra > 0.5:
+            print(f"  Os cortes caem em keyframes: ficam {fmt_duracao(sobra)} a mais de pausa no total "
+                  "(nunca fala). Para corte exato: --modo converter.")
+        if perdidos:
+            print(f"  [aviso] {perdidos} pausa(s) curtas demais para cortar sem reconverter ficam inteiras.")
+    else:
+        print(f"Modo converter ({motivo}): H.264 preset {video_tools.X264_PRESET}, "
+              f"CRF {video_tools.X264_CRF}, AAC. Demora, com progresso na tela.")
+    print(f"Editado:  {saida}")
+    print(f"Original: vai para {video.parent / PASTA_ORIGINAIS}/ junto com a lista de cortes.")
+    if saida.exists() and saida.resolve() != video.resolve() and not args.sim:
+        if not sim_nao(f"{saida} ja existe e nao e o original. Substituir?"):
+            return
     if not args.sim and not sim_nao("Gerar o video editado agora?", padrao=True):
         return
 
     saida_dir.mkdir(parents=True, exist_ok=True)
-    temporario = saida.with_name(f".{saida.stem}.cortando.mp4")
-    roteiro = saida.with_name(f".{saida.stem}.filtro.txt")
-    selecao = "+".join(f"between(t,{inicio:.3f},{fim:.3f})" for inicio, fim in mantidos)
-    fps = video_tools.output_fps(info)
-    filtros = [filtro for filtro in relatorio.video_filters if not filtro.startswith("fps=")]
-    if not any(filtro.startswith("scale=") for filtro in filtros):
-        filtros.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")  # H.264 yuv420p exige dimensoes pares
-    extras = "".join(f",{filtro}" for filtro in filtros)
-    tem_audio = info.audio_streams > 0
-    faixa = (args.faixa - 1) if args.faixa else 0
-    # Video em taxa constante antes de selecionar: select + setpts so ficam sincronizados assim.
-    grafo = f"[0:v:0]fps={fps},select='{selecao}',setpts=N/({fps}*TB){extras}[v]"
-    if tem_audio:
-        grafo += f";[0:a:{faixa}]aselect='{selecao}',asetpts=N/SR/TB[a]"
-    roteiro.write_text(grafo, encoding="utf-8")
-
-    canais = str(min(info.channels or 2, 2))
-    comando = [
-        "ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(video),
-        "-/filter_complex", str(roteiro), "-map", "[v]",
-        "-c:v", "libx264", "-preset", video_tools.X264_PRESET, "-crf", str(video_tools.X264_CRF),
-        "-profile:v", "high", "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
-        "-force_key_frames", f"expr:gte(t,n_forced*{video_tools.KEYFRAME_SECONDS})",
-    ]
-    if tem_audio:
-        comando += ["-map", "[a]", "-c:a", "aac", "-b:a", video_tools.AAC_BITRATE, "-ac", canais]
-    comando += ["-map_metadata", "0", "-movflags", "+faststart", "-f", "mp4", str(temporario)]
-
+    temporario = saida_dir / f".{video.stem}.cortando.mp4"
     try:
-        video_tools.run_ffmpeg(comando, final, "cortando")
-        resultado = video_tools.probe(temporario)
-        if resultado is None or abs(resultado.duration - final) > max(2.0, final * 0.002):
-            obtido = fmt_duracao(resultado.duration) if resultado else "?"
-            raise RuntimeError(f"duracao do resultado ({obtido}) nao bate com a esperada ({fmt_duracao(final)})")
+        if modo == "copia":
+            try:
+                cortar_copiando(video, plano, faixa, temporario)
+                conferir_resultado(temporario, final, max(1.0, 0.3 * len(plano)))
+            except RuntimeError as erro:
+                print(f"  [aviso] o corte sem reconverter falhou ({erro}).")
+                print("  Fazendo pelo modo converter.")
+                modo, final = "converter", exato
+                temporario.unlink(missing_ok=True)
+        if modo == "converter":
+            cortar_convertendo(video, info, relatorio, mantidos, faixa, temporario, exato)
+            conferir_resultado(temporario, exato, max(2.0, exato * 0.002))
+        # Tudo certo: original para orig/ e o editado no lugar (ou em --saida).
+        guardado = guardar_original(video, lista)
         os.replace(temporario, saida)
     except RuntimeError as erro:
         sys.exit(f"[erro] {erro}. O original nao foi alterado.")
     finally:
         temporario.unlink(missing_ok=True)
-        roteiro.unlink(missing_ok=True)
 
     tamanho = saida.stat().st_size
-    print(f"[ok] {saida} ({fmt_duracao(final)}, {tamanho / 1024 ** 2:.0f} MB)")
+    original = guardado.stat().st_size
+    print(f"[ok] {saida} ({fmt_duracao(final)}, {tamanho / 1024 ** 2:.0f} MB; "
+          f"original {original / 1024 ** 2:.0f} MB)")
+    print(f"     Original e lista de cortes em {guardado.parent}/")
+    if modo == "converter" and tamanho > original * final / duracao * 1.1:
+        print("  [aviso] a conversao ficou maior que o original (proporcionalmente).")
     if tamanho > 2000 * 1024 ** 2:
         print("Acima de 2000 MB: o ttm.py vai dividir em partes (PART1, PART2...) na hora de enviar.")
 
@@ -1125,12 +1313,16 @@ def main():
 
     p = comandos.add_parser("cortar", help="Gera o video sem os trechos CORTAR.")
     p.add_argument("alvo", help="Video ou o .cortes.txt dele.")
-    p.add_argument("--saida", help=f"Pasta de destino (padrao: <pasta do video>/{PASTA_EDITADOS}/).")
+    p.add_argument("--saida", help="Pasta do editado (padrao: o lugar do original, que vai para orig/).")
+    p.add_argument("--modo", choices=["auto", "copia", "converter"], default="auto",
+                   help="auto: corta sem reconverter se o video ja for H.264/AAC, senao converte; "
+                        "copia: sempre sem reconverter (corte no keyframe); converter: sempre reconverte "
+                        "(corte exato).")
     p.add_argument("--faixa", type=int, default=None, help="Faixa de audio do resultado (padrao 1).")
     p.add_argument("--crf", type=int, default=video_tools.X264_CRF, choices=range(15, 36), metavar="N",
-                   help=f"Qualidade H.264 (padrao {video_tools.X264_CRF}).")
+                   help=f"Qualidade H.264 no modo converter (padrao {video_tools.X264_CRF}).")
     p.add_argument("--preset", default=video_tools.X264_PRESET, choices=video_tools.X264_PRESETS,
-                   help=f"Velocidade H.264 (padrao {video_tools.X264_PRESET}).")
+                   help=f"Velocidade H.264 no modo converter (padrao {video_tools.X264_PRESET}).")
     p.add_argument("--sim", action="store_true", help="Nao pede confirmacao (gera e substitui um editado que ja exista).")
     p.set_defaults(func=cortar)
 

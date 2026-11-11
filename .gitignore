@@ -21,7 +21,10 @@ originais/
 *.cortes.txt
 *.cortes.txt.tmp
 .cortar_silencio.json
+orig/
 editados/
+.*.parte[0-9]*.mp4
+.*.partes.txt
 .*.cortando.mp4
 .*.filtro.txt
 *_info_*segundos.txt

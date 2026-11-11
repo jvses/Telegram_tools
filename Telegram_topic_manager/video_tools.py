@@ -91,6 +91,7 @@ class VideoInfo:
     width: int = 0
     height: int = 0
     fps: float = 0.0          # 0 = taxa variavel/desconhecida (comum em gravacao de tela)
+    nominal_fps: float = 0.0  # r_frame_rate: taxa de captura (em video de taxa variavel, a media e menor)
     vbitrate: int = 0
     field_order: str | None = None
     acodec: str | None = None
@@ -185,6 +186,7 @@ def probe(path):
         width=int(video.get("width") or 0),
         height=int(video.get("height") or 0),
         fps=_frame_rate(video),
+        nominal_fps=_nominal_rate(video),
         vbitrate=int(_float(video.get("bit_rate"))),
         field_order=video.get("field_order"),
         acodec=audio.get("codec_name"),
@@ -254,6 +256,11 @@ def _frame_rate(stream):
         if 0 < rate <= 240:
             return rate
     return 0.0
+
+
+def _nominal_rate(stream):
+    rate = _fraction(stream.get("r_frame_rate"))
+    return rate if 0 < rate <= MAX_FPS + 1 else 0.0
 
 
 def _rotation(stream):
@@ -455,6 +462,11 @@ def ffmpeg_args(report, output, crf=None, max_rate=None):
 
 def output_fps(info):
     fps = info.fps if info else 0
+    # Gravacao de tela com taxa variavel: a media (ex.: 11 fps, porque a tela ficou parada) nao
+    # serve de taxa de saida; os quadros sairiam a cada 89 ms e o corte perderia sincronia.
+    # Usa a taxa de captura (r_frame_rate) quando ela e plausivel e maior que a media.
+    if info and info.nominal_fps > fps * 1.2:
+        fps = info.nominal_fps
     if fps > MAX_FPS + 1:
         fps = MAX_FPS
     elif not fps:
