@@ -573,6 +573,11 @@ def _fallback_encode(report, first, duration, max_bytes, parts, temps):
     return retry
 
 
+def run_ffmpeg(args, duration, label):
+    """Roda o ffmpeg mostrando o progresso (usado tambem por tratamento_video/)."""
+    _run_ffmpeg(args, duration, label)
+
+
 def _run_ffmpeg(args, duration, label):
     args = list(args)
     args[1:1] = ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]

@@ -1,13 +1,14 @@
 # Telegram Tools
 
-Duas ferramentas de linha de comando, em Python, para gerenciar conteúdo em supergrupos do Telegram com tópicos (fórum). Elas usam a sua conta de usuário, não um bot.
+Ferramentas de linha de comando, em Python, para gerenciar conteúdo em supergrupos do Telegram com tópicos (fórum). As duas ferramentas do Telegram usam a sua conta de usuário, não um bot.
 
 | Ferramenta | O que faz |
 |---|---|
 | [Telegram_topic_manager](Telegram_topic_manager/README.md) | Envia cada pasta de `input/` para um tópico (criado ou já existente) de um supergrupo onde você é admin. |
 | [Telegram_specific_topic_dl](Telegram_specific_topic_dl/README.md) | Baixa as mídias de um canal, de um grupo ou de um tópico específico de um supergrupo. |
+| [tratamento_video](tratamento_video/README.md) | Prepara gravações de aula antes do envio: detecta as pausas, ajuda a revisar e corta o vídeo. |
 
-As duas são independentes: cada uma é executada sozinha. Elas compartilham o ambiente virtual, as credenciais e a sessão de login, que ficam na raiz do repositório.
+Cada ferramenta é executada sozinha. As duas do Telegram compartilham o ambiente virtual, as credenciais e a sessão de login, que ficam na raiz do repositório. O `tratamento_video` só precisa do `ffmpeg`.
 
 ```
 telegram_tools/
@@ -19,8 +20,10 @@ telegram_tools/
 ├── Telegram_topic_manager/
 │   ├── ttm.py
 │   └── video_tools.py      análise e conversão de vídeos com ffmpeg
-└── Telegram_specific_topic_dl/
-    └── tldlsp.py
+├── Telegram_specific_topic_dl/
+│   └── tldlsp.py
+└── tratamento_video/
+    └── cortar_silencio.py  detecta e corta pausas em gravações de aula
 ```
 
 ## Requisitos e compatibilidade

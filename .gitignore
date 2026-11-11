@@ -16,6 +16,17 @@ config.json.tmp
 output/
 # Videos originais guardados depois da conversao com ffmpeg
 originais/
+# tratamento_video: arquivos gerados ao lado dos videos (listas de cortes, mascara da tela,
+# previas, videos editados) e saidas/backups do detectar_silencio.py antigo
+*.cortes.txt
+*.cortes.txt.tmp
+.cortar_silencio.json
+editados/
+.*.cortando.mp4
+.*.filtro.txt
+*_info_*segundos.txt
+*_info_*segundos.txt.*
+*.bk
 # Telegram_specific_topic_dl: midias baixadas
 downloads/
 ideias_alteracoes.txt
