@@ -1,0 +1,61 @@
+# ===== Credenciais e sessao do Telegram (NUNCA subir) =====
+# user.session e a conta logada: quem tiver o arquivo acessa a conta.
+*.session
+*.session-journal
+# api_id / api_hash gerados na primeira execucao
+config.json
+.env
+.env.*
+
+# ===== Dados de uso (conteudo pessoal / com direitos autorais) =====
+# Telegram_topic_manager: pastas de cursos a enviar e ja enviadas
+# (o **/ e necessario: "input/*" sozinho so valeria na raiz do repositorio)
+**/input/*
+!**/input/.gitkeep
+output/
+# Telegram_specific_topic_dl: midias baixadas
+downloads/
+
+# Midias soltas, como as pastas que o tldlsp.py antigo cria ao lado do script.
+# Para imagens de documentacao, use a pasta docs/ (liberada abaixo).
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+*.m4v
+*.mp3
+*.m4a
+*.ogg
+*.oga
+*.opus
+*.wav
+*.pdf
+*.zip
+*.rar
+*.7z
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+!docs/**
+
+# Downloads incompletos (Telethon / yt-dlp)
+*.part
+*.part-Frag*
+*.ytdl
+
+# ===== Python =====
+.venv/
+.tldl_venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.log
+
+# ===== Editor / sistema =====
+.vscode/
+.idea/
+.DS_Store
